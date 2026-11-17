@@ -1,0 +1,55 @@
+{
+  "name": "squeeze",
+  "version": "1.0.0",
+  "description": "Squeeze file compressor",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.example.squeeze",
+    "productName": "Squeeze",
+    "files": [
+      "main.js",
+      "preload.js",
+      "media.js",
+      "index.html",
+      "package.json",
+      "node_modules/ffmpeg-static/**/*"
+    ],
+    "win": {
+      "icon": "Squeeze.ico",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "installerIcon": "Squeeze.ico",
+      "uninstallerIcon": "Squeeze.ico",
+      "installerHeaderIcon": "Squeeze.ico",
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    },
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^45.3.3",
+    "electron-builder": "^26.18.0"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  }
+}
