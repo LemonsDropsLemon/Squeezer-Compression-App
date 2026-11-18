@@ -169,12 +169,14 @@ ipcMain.handle('native-compress', async (event, job) => {
   }
   const id = Number(job.id) || 0;
   const quality = ['high', 'bal', 'small'].includes(job.quality) ? job.quality : 'bal';
+  const lossless = job.mode === 'lossless';
   const threads = Math.max(1, Math.min(Number(job.threads) || 1, os.cpus().length || 1));
 
   const r = await media.compress({
     inPath: job.path,
     ext,
     quality,
+    lossless,
     threads,
     tmpDir: media.tmpRoot(),
     outName: `${id}-${path.basename(job.path)}`,
@@ -232,5 +234,3 @@ app.on('window-all-closed', () => {
     app.quit();
   }
 });
-
-// Hello from the developer :D
