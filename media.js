@@ -1,4 +1,3 @@
-
 const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -6,10 +5,10 @@ const path = require('path');
 
 const MB = 1048576;
 
-const VIDEO = new Set(['mp4', 'm4v', 'mov', 'mkv', 'avi', 'webm', 'flv']);
-const AUDIO = new Set(['mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'flac', 'wav']);
+const VIDEO = new Set(['mp4', 'm4v', 'mov', 'mkv', 'avi', 'webm', 'flv', 'ts', '3gp']);
+const AUDIO = new Set(['mp3', 'm4a', 'm4b', 'aac', 'ogg', 'oga', 'opus', 'flac', 'wav', 'wma', 'mka']);
 const IMAGE = new Set(['gif', 'bmp']);
-const NATIVE = new Set([...VIDEO, ...AUDIO, ...IMAGE, 'pdf', 'psd']);
+const NATIVE = new Set([...VIDEO, ...AUDIO, ...IMAGE, 'pdf', 'psd', 'tif', 'tiff']);
 
 let cachedBin;
 function ffmpegBin() {
@@ -71,7 +70,7 @@ const Q = {
   small: { crf: 30, x265: 32, vp9: 40, aac: 64,  mp3: 96,  opus: 48, vorbis: 1.5, colors: 64,  pdfq: 9, pdfMax: 1700 }
 };
 const MUXER = { mp4: 'mp4', m4v: 'mp4', mov: 'mov', mkv: 'matroska', avi: 'avi', webm: 'webm', flv: 'flv',
-  mp3: 'mp3', m4a: 'ipod', aac: 'adts', ogg: 'ogg', oga: 'ogg', opus: 'opus', flac: 'flac', wav: 'wav', gif: 'gif' };
+  mp3: 'mp3', m4a: 'ipod', m4b: 'ipod', ts: 'mpegts', '3gp': '3gp', wma: 'asf', mka: 'matroska', aac: 'adts', ogg: 'ogg', oga: 'ogg', opus: 'opus', flac: 'flac', wav: 'wav', gif: 'gif' };
 
 function recipe(ext, qName, info, threads, withSubs) {
   const P = Q[qName] || Q.bal, t = String(Math.max(1, threads | 0));
@@ -87,10 +86,13 @@ function recipe(ext, qName, info, threads, withSubs) {
   const isVideo = VIDEO.has(ext) && info.hasVideo;
   if (!isVideo) {
     if (!info.hasAudio) return { skip: 'no audio or video stream' };
-    const kb = { mp3: P.mp3, m4a: P.aac, aac: P.aac, opus: P.opus }[ext] || P.aac;
-    if (['mp3', 'm4a', 'aac', 'opus'].includes(ext) && info.bitrate && info.bitrate <= kb * 1.05) return { skip: 'already small' };
+    const kb = { mp3: P.mp3, m4a: P.aac, m4b: P.aac, aac: P.aac, opus: P.opus, wma: P.aac, mka: P.opus }[ext] || P.aac;
+    if (['mp3', 'm4a', 'm4b', 'aac', 'opus', 'wma'].includes(ext) && info.bitrate && info.bitrate <= kb * 1.05) return { skip: 'already small' };
     switch (ext) {
       case 'mp3':  return { args: [...base, '-map', '0:a', '-map', '0:v?', '-c:v', 'copy', '-c:a', 'libmp3lame', '-b:a', kb + 'k', '-id3v2_version', '3', '-f', 'mp3'] };
+      case 'wma':  return { args: [...base, '-vn', '-c:a', 'wmav2', '-b:a', kb + 'k', '-f', 'asf'] };
+      case 'mka':  return { args: [...base, '-map', '0:a', '-c:a', 'libopus', '-b:a', kb + 'k', '-f', 'matroska'] };
+      case 'm4b':
       case 'm4a':  return { args: [...base, '-map', '0:a', '-map', '0:v?', '-c:v', 'copy', '-c:a', 'aac', '-b:a', kb + 'k', '-movflags', '+faststart', '-f', 'ipod'] };
       case 'aac':  return { args: [...base, '-vn', '-c:a', 'aac', '-b:a', kb + 'k', '-f', 'adts'] };
       case 'opus': return { args: [...base, '-vn', '-c:a', 'libopus', '-b:a', kb + 'k', '-f', 'opus'] };
@@ -118,7 +120,7 @@ function recipe(ext, qName, info, threads, withSubs) {
   }
   if (info.vcodec === 'hevc') {
     args.push('-vf', even, '-c:v', 'libx265', '-crf', String(P.x265), '-preset', 'medium', '-pix_fmt', 'yuv420p');
-    if (ext !== 'mkv' && ext !== 'avi' && ext !== 'flv') args.push('-tag:v', 'hvc1');
+    if (ext === 'mp4' || ext === 'mov' || ext === 'm4v') args.push('-tag:v', 'hvc1');
   } else {
     args.push('-vf', even, '-c:v', 'libx264', '-crf', String(P.crf), '-preset', 'medium', '-pix_fmt', 'yuv420p');
   }
@@ -185,9 +187,10 @@ async function compressWithFfmpeg(job, outPath, onProgress, procs) {
   }
   return { ok: true, size };
 }
-function ffJpeg(input, args) {
+
+function ffJpeg(input, inArgs, outArgs) {
   return new Promise((resolve, reject) => {
-    const p = spawn(ffmpegBin(), ['-hide_banner', '-loglevel', 'error', '-nostdin', '-threads', '1', '-f', 'mjpeg', '-i', 'pipe:0', ...args, '-frames:v', '1', '-pix_fmt', 'yuvj420p', '-f', 'mjpeg', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
+    const p = spawn(ffmpegBin(), ['-hide_banner', '-loglevel', 'error', '-nostdin', '-threads', '1', ...inArgs, '-i', 'pipe:0', ...outArgs, '-frames:v', '1', '-f', 'mjpeg', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
     const out = [];
     p.stdout.on('data', d => out.push(d));
     p.on('error', reject);
@@ -196,6 +199,7 @@ function ffJpeg(input, args) {
     p.stdin.end(input);
   });
 }
+
 function jpegInfo(b) {
   if (b.length < 4 || b[0] !== 0xFF || b[1] !== 0xD8) return null;
   let i = 2;
@@ -210,6 +214,116 @@ function jpegInfo(b) {
   }
   return null;
 }
+const zlibMod = require('zlib');
+const { promisify } = require('util');
+const inflateAsync = promisify(zlibMod.inflate), deflateAsync = promisify(zlibMod.deflate);
+function readBE(b, off, n) { let v = 0; for (let i = 0; i < n; i++) v = v * 256 + b[off + i]; return v; }
+function balancedDict(txt, from) {
+  const s = txt.indexOf('<<', from); if (s < 0) return null;
+  let d = 0, i = s;
+  while (i < txt.length) {
+    if (txt.startsWith('<<', i)) { d++; i += 2; }
+    else if (txt.startsWith('>>', i)) { d--; i += 2; if (d === 0) return { start: s, end: i }; }
+    else i++;
+  }
+  return null;
+
+function removeKey(d, key) {
+  const k = d.indexOf(key); if (k < 0) return d;
+  let i = k + key.length; while (/\s/.test(d[i])) i++;
+  let end;
+  if (d.startsWith('<<', i)) { const bd = balancedDict(d, i); end = bd ? bd.end : i; }
+  else if (d[i] === '[') end = d.indexOf(']', i) + 1;
+  else { const m = /^\d+\s+\d+\s+R|^[^\s\/<>\[\]]+/.exec(d.slice(i)); end = i + (m ? m[0].length : 0); }
+  return d.slice(0, k) + d.slice(end);
+}
+function pngUnfilter(data, columns, colors, bpc) {
+  const bpp = Math.max(1, Math.ceil(colors * bpc / 8)), rowBytes = Math.ceil(columns * colors * bpc / 8), stride = rowBytes + 1;
+  if (!rowBytes || data.length % stride) return null;
+  const rows = data.length / stride, out = Buffer.alloc(rows * rowBytes);
+  for (let r = 0; r < rows; r++) {
+    const f = data[r * stride], src = r * stride + 1, dst = r * rowBytes, up = dst - rowBytes;
+    for (let i = 0; i < rowBytes; i++) {
+      const x = data[src + i], a = i >= bpp ? out[dst + i - bpp] : 0, b = r > 0 ? out[up + i] : 0, c = (i >= bpp && r > 0) ? out[up + i - bpp] : 0;
+      let v;
+      switch (f) {
+        case 0: v = x; break;
+        case 1: v = x + a; break;
+        case 2: v = x + b; break;
+        case 3: v = x + ((a + b) >> 1); break;
+        case 4: { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); v = x + ((pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c)); break; }
+        default: return null;
+      }
+      out[dst + i] = v & 255;
+    }
+  }
+  return out;
+
+function decodeFlate(raw, dict) {
+  let data; try { data = zlibMod.inflateSync(raw); } catch (_) { return null; }
+  const pm = /\/Predictor\s+(\d+)/.exec(dict);
+  if (!pm || +pm[1] === 1) return data;
+  if (+pm[1] < 10) return null;
+  const col = /\/Columns\s+(\d+)/.exec(dict), clr = /\/Colors\s+(\d+)/.exec(dict), bpc = /\/BitsPerComponent\s+(\d+)/.exec(dict);
+  return pngUnfilter(data, col ? +col[1] : 1, clr ? +clr[1] : 1, bpc ? +bpc[1] : 8);
+}
+
+function readXrefChain(buf, txt) {
+  const sx = txt.lastIndexOf('startxref'); if (sx < 0) return null;
+  const entries = new Map(), seen = new Set();
+  let queue = [parseInt(txt.slice(sx + 9, sx + 40).trim(), 10)], newest = null;
+  while (queue.length) {
+    const pos = queue.shift();
+    if (!Number.isFinite(pos) || pos < 0 || pos >= txt.length || seen.has(pos)) continue;
+    seen.add(pos);
+    let i = pos; while (i < txt.length && /\s/.test(txt[i])) i++;
+    let dictText = null;
+    if (txt.startsWith('xref', i)) {
+      i += 4;
+      const subRe = /\s*(\d+)[ \t]+(\d+)[ \t]*\r?\n/y, entRe = /\s*(\d{10})[ \t](\d{5})[ \t]([nf])/y;
+      for (;;) {
+        subRe.lastIndex = i; const sm = subRe.exec(txt); if (!sm) break;
+        i = subRe.lastIndex;
+        for (let k = 0; k < +sm[2]; k++) {
+          entRe.lastIndex = i; const em = entRe.exec(txt); if (!em) return null;
+          i = entRe.lastIndex;
+          const n = +sm[1] + k;
+          if (!entries.has(n)) entries.set(n, em[3] === 'n' ? { type: 1, a: +em[1], b: +em[2] } : { type: 0, a: 0, b: 0 });
+        }
+      }
+      const ti = txt.indexOf('trailer', i), bd = ti < 0 ? null : balancedDict(txt, ti);
+      if (!bd) return null;
+      dictText = txt.slice(bd.start, bd.end);
+      const xs = /\/XRefStm\s+(\d+)/.exec(dictText), pv = /\/Prev\s+(\d+)/.exec(dictText);
+      queue = [...(xs ? [+xs[1]] : []), ...(pv ? [+pv[1]] : []), ...queue];
+    } else {
+      const om = /(\d+)[ \t]+(\d+)[ \t]+obj/y; om.lastIndex = i;
+      if (!om.exec(txt)) return null;
+      const bd = balancedDict(txt, om.lastIndex); if (!bd) return null;
+      dictText = txt.slice(bd.start, bd.end);
+      const sm = /^[ \t\r\n]*stream(\r\n|\n|\r)/.exec(txt.slice(bd.end, bd.end + 12)), lm = /\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dictText);
+      if (!sm || !lm) return null;
+      const ds = bd.end + sm[0].length;
+      let data = /\/FlateDecode/.test(dictText) ? decodeFlate(buf.subarray(ds, ds + +lm[1]), dictText) : buf.subarray(ds, ds + +lm[1]);
+      if (!data) return null;
+      const wm = /\/W\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s*\]/.exec(dictText); if (!wm) return null;
+      const W = [+wm[1], +wm[2], +wm[3]], rowLen = W[0] + W[1] + W[2];
+      const im = /\/Index\s*\[([^\]]*)\]/.exec(dictText), size = /\/Size\s+(\d+)/.exec(dictText);
+      const idx = im ? im[1].trim().split(/\s+/).map(Number) : [0, size ? +size[1] : 0];
+      let p = 0;
+      for (let k = 0; k + 1 < idx.length; k += 2) for (let n = idx[k]; n < idx[k] + idx[k + 1]; n++) {
+        if (p + rowLen > data.length) return null;
+        const t = W[0] ? readBE(data, p, W[0]) : 1, a = readBE(data, p + W[0], W[1]), b = readBE(data, p + W[0] + W[1], W[2]);
+        p += rowLen;
+        if (!entries.has(n)) entries.set(n, { type: t, a, b });
+      }
+      const pv = /\/Prev\s+(\d+)/.exec(dictText);
+      if (pv) queue.push(+pv[1]);
+    }
+    if (!newest) newest = dictText;
+  }
+  return newest ? { entries, dictText: newest } : null;
+}
 
 async function pdfShrink(job, outPath, procs) {
   const P = Q[job.quality] || Q.bal;
@@ -217,7 +331,8 @@ async function pdfShrink(job, outPath, procs) {
   if (st.size > 400 * MB) return { ok: false, reason: 'pdf too large to rewrite' };
   const buf = fs.readFileSync(job.inPath), txt = buf.toString('latin1');
   if (!txt.startsWith('%PDF-')) return { ok: false, reason: 'not a pdf' };
-  if (/\/Type\s*\/(ObjStm|XRef)\b/.test(txt) || /\/Encrypt\b/.test(txt)) return { ok: false, reason: 'pdf structure not supported' };
+  if (/\/Encrypt\b/.test(txt)) return { ok: false, reason: 'pdf structure not supported' };
+  const modern = /\/Type\s*\/(ObjStm|XRef)\b/.test(txt);
 
   const objRe = /(\d+)[ \t]+(\d+)[ \t]+obj\b/g, endRe = />>[ \t\r\n]*stream(\r\n|\n|\r)|endobj/g;
   const objs = []; let pos = 0;
@@ -255,45 +370,86 @@ async function pdfShrink(job, outPath, procs) {
   }
   if (!objs.length) return { ok: false, reason: 'no objects found' };
   const last = new Map(); objs.forEach((o, i) => last.set(o.num, i));
-  const keep = objs.filter((o, i) => last.get(o.num) === i && !(i === 0 && /\/Linearized\b/.test(txt.slice(o.dictStart, o.dictEnd))));
+  const dictOf = o => txt.slice(o.dictStart, o.dictEnd);
+
+  let keep, entries = null, trailerSrc = null;
+  if (modern) {
+    const chain = readXrefChain(buf, txt);
+    if (!chain) return { ok: false, reason: 'pdf structure not supported' };
+    entries = chain.entries; trailerSrc = chain.dictText;
+    keep = objs.filter((o, i) => last.get(o.num) === i && entries.get(o.num) && entries.get(o.num).type === 1
+      && !/\/Type\s*\/XRef\b/.test(dictOf(o)) && !(i === 0 && /\/Linearized\b/.test(dictOf(o))));
+  } else {
+    keep = objs.filter((o, i) => last.get(o.num) === i && !(i === 0 && /\/Linearized\b/.test(dictOf(o))));
+  }
 
   const cands = [];
   for (const o of keep) {
-    if (!o.stream || o.dataEnd - o.dataStart < 24 * 1024) continue;
-    const d = txt.slice(o.dictStart, o.dictEnd);
-    if (!/\/Subtype\s*\/Image\b/.test(d) || /\/ImageMask\s+true/.test(d) || /\/DecodeParms|\/Decode\b|\/Mask\b/.test(d)) continue;
+    if (!o.stream) continue;
+    const d = dictOf(o);
+    if (job.lossless) {
+      if (o.dataEnd - o.dataStart < 2048 || /\/Type\s*\/(XRef|ObjStm)\b/.test(d)) continue;
+      const lf = /\/Filter\s*(\[[^\]]*\]|\/[A-Za-z0-9]+)/.exec(d), ln = lf ? lf[1].match(/[A-Za-z0-9]+/g) : [];
+      if (ln.length === 1 && ln[0] === 'FlateDecode') cands.push({ o, kind: 'reflate', data: buf.subarray(o.dataStart, o.dataEnd), w: 0, h: 0 });
+      continue;
+    }
+    if (o.dataEnd - o.dataStart < 24 * 1024) continue;
+    if (!/\/Subtype\s*\/Image\b/.test(d) || /\/ImageMask\s+true/.test(d) || /\/Decode\b|\/Mask\b/.test(d)) continue;
     const fm = /\/Filter\s*(\[[^\]]*\]|\/[A-Za-z0-9]+)/.exec(d);
     const names = fm ? fm[1].match(/[A-Za-z0-9]+/g) : [];
-    if (names.length !== 1 || names[0] !== 'DCTDecode') continue;
-    if (/Indexed|CMYK|\/Lab|Separation|DeviceN/.test(d)) continue;
+    if (names.length !== 1) continue;
     const bits = /\/BitsPerComponent\s+(\d+)/.exec(d);
     if (bits && +bits[1] !== 8) continue;
-    const data = buf.subarray(o.dataStart, o.dataEnd), ji = jpegInfo(data);
-    if (!ji || ji.comps !== 3 || ji.bits !== 8) continue;
     const w = /\/Width\s+(\d+)/.exec(d), h = /\/Height\s+(\d+)/.exec(d);
     if (!w || !h) continue;
-    cands.push({ o, data, w: +w[1], h: +h[1] });
+    const data = buf.subarray(o.dataStart, o.dataEnd);
+    if (names[0] === 'DCTDecode') {
+      if (/\/DecodeParms|Indexed|CMYK|\/Lab|Separation|DeviceN/.test(d)) continue;
+      const ji = jpegInfo(data);
+      if (!ji || ji.bits !== 8 || (ji.comps !== 3 && ji.comps !== 1)) continue;
+      cands.push({ o, kind: 'jpeg', comps: ji.comps, data, w: +w[1], h: +h[1] });
+    } else if (names[0] === 'FlateDecode') {
+      const cs = /\/ColorSpace\s*\/(DeviceRGB|DeviceGray)\b/.exec(d);
+      if (!cs) continue;
+      const comps = cs[1] === 'DeviceRGB' ? 3 : 1;
+      if (data.length < 64 * 1024) continue;
+      cands.push({ o, kind: 'flate', comps, data, w: +w[1], h: +h[1], dict: d });
+    }
   }
-  if (!cands.length) return { ok: false, reason: 'nothing to shrink in this pdf' };
+  if (!cands.length) return { ok: false, reason: job.lossless ? 'already small' : 'nothing to shrink in this pdf' };
 
   let next = 0, done = 0;
   const worker = async () => {
     while (next < cands.length) {
       const c = cands[next++];
       try {
-        const long = Math.max(c.w, c.h), vf = [];
+        if (c.kind === 'reflate') {
+          const raw = await inflateAsync(c.data), z = await deflateAsync(raw, { level: 9 });
+          if (z.length < c.data.length * 0.98 && (await inflateAsync(z)).equals(raw)) { c.out = z; c.nw = 0; c.nh = 0; }
+          if (job.onProgress) job.onProgress(Math.round(++done / cands.length * 90));
+          continue;
+        }
+        let src = c.data, inArgs = ['-f', 'mjpeg'];
+        if (c.kind === 'flate') {
+          const raw = decodeFlate(c.data, c.dict);
+          if (!raw || raw.length !== c.w * c.h * c.comps) throw new Error('unusual image');
+          src = raw; inArgs = ['-f', 'rawvideo', '-pix_fmt', c.comps === 3 ? 'rgb24' : 'gray', '-s', `${c.w}x${c.h}`];
+        }
+        const long = Math.max(c.w, c.h), outArgs = [];
         let nw = c.w, nh = c.h;
-        if (P.pdfMax && long > P.pdfMax) { const k = P.pdfMax / long; nw = Math.max(1, Math.round(c.w * k)); nh = Math.max(1, Math.round(c.h * k)); vf.push('-vf', `scale=${nw}:${nh}:flags=lanczos`); }
-        const out = await ffJpeg(c.data, [...vf, '-q:v', String(P.pdfq)]);
+        if (P.pdfMax && long > P.pdfMax) { const k = P.pdfMax / long; nw = Math.max(1, Math.round(c.w * k)); nh = Math.max(1, Math.round(c.h * k)); outArgs.push('-vf', `scale=${nw}:${nh}:flags=lanczos`); }
+        outArgs.push('-q:v', String(P.pdfq), '-pix_fmt', c.comps === 3 ? 'yuvj420p' : 'gray');
+        const out = await ffJpeg(src, inArgs, outArgs);
         const ji = jpegInfo(out);
-        if (ji && ji.comps === 3 && out.length < c.data.length * 0.9) { c.out = out; c.nw = nw; c.nh = nh; }
+        const limit = c.kind === 'flate' ? 0.7 : 0.9;
+        if (ji && ji.comps === c.comps && out.length < c.data.length * limit) { c.out = out; c.nw = nw; c.nh = nh; }
       } catch (_) { /* keep the original picture */ }
       if (job.onProgress) job.onProgress(Math.round(++done / cands.length * 90));
     }
   };
   await Promise.all(Array.from({ length: Math.max(1, Math.min(job.threads | 0 || 1, cands.length)) }, worker));
   const changed = new Map(cands.filter(c => c.out).map(c => [c.o, c]));
-  if (!changed.size) return { ok: false, reason: 'pictures already small' };
+  if (!changed.size) return { ok: false, reason: job.lossless ? 'already small' : 'pictures already small' };
 
   const parts = [buf.subarray(0, keep[0].start)]; let cur = parts[0].length;
   const offsets = new Map();
@@ -303,31 +459,59 @@ async function pdfShrink(job, outPath, procs) {
     const c = changed.get(o);
     if (!c) { push(buf.subarray(o.start, o.end)); push(Buffer.from('\n')); continue; }
     let head = txt.slice(o.start, o.dictEnd);
-    head = /\/Length(?![0-9A-Za-z])\s+\d+(\s+\d+\s+R)?/.test(head) ? head.replace(/\/Length(?![0-9A-Za-z])\s+\d+(\s+\d+\s+R)?/, '/Length ' + c.out.length) : head.replace(/>>$/, '/Length ' + c.out.length + '>>');
+    if (c.kind === 'flate') {
+      head = removeKey(head, '/DecodeParms').replace(/\/Filter\s*(\[[^\]]*\]|\/[A-Za-z0-9]+)/, '/Filter /DCTDecode');
+    }
+    head = /\/Length(?![0-9A-Za-z])\s+\d+(\s+\d+\s+R)?/.test(head) ? head.replace(/\/Length(?![0-9A-Za-z])\s+\d+(\s+\d+\s+R)?/, '/Length ' + c.out.length) : head.replace(/>>\s*$/, '/Length ' + c.out.length + '>>');
     if (c.nw !== c.w) head = head.replace(/\/Width\s+\d+/, '/Width ' + c.nw).replace(/\/Height\s+\d+/, '/Height ' + c.nh);
     push(Buffer.from(head + '\nstream\n', 'latin1')); push(c.out); push(Buffer.from('\nendstream\nendobj\n'));
   }
   let root = null, info = null, id = null;
-  for (const m of txt.matchAll(/trailer\s*<</g)) {
-    const seg = txt.slice(m.index, m.index + 2000);
+  const trailers = modern ? [trailerSrc] : [...txt.matchAll(/trailer\s*<</g)].map(m => txt.slice(m.index, m.index + 2000));
+  for (const seg of trailers) {
     const r = /\/Root\s+(\d+)\s+(\d+)\s+R/.exec(seg), i = /\/Info\s+(\d+)\s+(\d+)\s+R/.exec(seg), d = /\/ID\s*\[\s*(<[0-9A-Fa-f]*>|\((?:[^)\\]|\\.)*\))\s*(<[0-9A-Fa-f]*>|\((?:[^)\\]|\\.)*\))\s*\]/.exec(seg);
     if (r) root = r[0]; if (i) info = i[0]; if (d) id = d[0];
   }
   if (!root) return { ok: false, reason: 'no document root' };
   const rootNum = +/\/Root\s+(\d+)/.exec(root)[1];
-  if (!offsets.has(rootNum)) return { ok: false, reason: 'root object missing' };
-  const size = Math.max(...offsets.keys()) + 1, xrefAt = cur;
-  let x = `xref\n0 ${size}\n0000000000 65535 f \n`;
-  for (let n = 1; n < size; n++) {
-    const e = offsets.get(n);
-    x += e ? String(e.off).padStart(10, '0') + ' ' + String(e.gen).padStart(5, '0') + ' n \n' : '0000000000 00000 f \n';
-  }
-  x += `trailer\n<< /Size ${size} ${root}${info ? ' ' + info : ''}${id ? ' ' + id : ''} >>\nstartxref\n${xrefAt}\n%%EOF\n`;
-  push(Buffer.from(x, 'latin1'));
-  const out = Buffer.concat(parts);
+  if (!offsets.has(rootNum) && !(entries && entries.get(rootNum) && entries.get(rootNum).type === 2)) return { ok: false, reason: 'root object missing' };
 
-  const ot = out.toString('latin1', 0, Math.min(out.length, xrefAt));
-  for (const [n, e] of offsets) if (!new RegExp('^' + n + '[ \\t]+' + e.gen + '[ \\t]+obj').test(ot.slice(e.off, e.off + 24))) return { ok: false, reason: 'rewritten xref invalid' };
+  let expected;
+  if (!modern) {
+    const size = Math.max(...offsets.keys()) + 1, xrefAt = cur;
+    let x = `xref\n0 ${size}\n0000000000 65535 f \n`;
+    for (let n = 1; n < size; n++) {
+      const e = offsets.get(n);
+      x += e ? String(e.off).padStart(10, '0') + ' ' + String(e.gen).padStart(5, '0') + ' n \n' : '0000000000 00000 f \n';
+    }
+    x += `trailer\n<< /Size ${size} ${root}${info ? ' ' + info : ''}${id ? ' ' + id : ''} >>\nstartxref\n${xrefAt}\n%%EOF\n`;
+    push(Buffer.from(x, 'latin1'));
+    expected = new Map([...offsets].map(([n, e]) => [n, e]));
+  } else {
+    const topNum = Math.max(...offsets.keys(), ...entries.keys()) + 1, size = topNum + 1, xrefAt = cur;
+    const rows = Buffer.alloc(size * 7);
+    for (let n = 0; n < size; n++) {
+      let t = 0, a = 0, g = n === 0 ? 65535 : 0;
+      if (n === topNum) { t = 1; a = xrefAt; g = 0; }
+      else if (offsets.has(n)) { t = 1; a = offsets.get(n).off; g = offsets.get(n).gen; }
+      else { const e = entries.get(n); if (e && e.type === 2 && offsets.has(e.a) && e.b < 65536) { t = 2; a = e.a; g = e.b; } }
+      rows[n * 7] = t; rows.writeUInt32BE(a >>> 0, n * 7 + 1); rows.writeUInt16BE(g & 0xFFFF, n * 7 + 5);
+    }
+    const z = zlibMod.deflateSync(rows, { level: 9 });
+    push(Buffer.from(`${topNum} 0 obj\n<< /Type /XRef /Size ${size} /W [1 4 2] ${root}${info ? ' ' + info : ''}${id ? ' ' + id : ''} /Filter /FlateDecode /Length ${z.length} >>\nstream\n`, 'latin1'));
+    push(z); push(Buffer.from(`\nendstream\nendobj\nstartxref\n${xrefAt}\n%%EOF\n`));
+    expected = new Map([...offsets].map(([n, e]) => [n, e]));
+    expected.set(topNum, { off: xrefAt, gen: 0 });
+  }
+  const out = Buffer.concat(parts);
+  const ot = out.toString('latin1');
+  for (const [n, e] of expected) if (!new RegExp('^' + n + '[ \\t]+' + e.gen + '[ \\t]+obj').test(ot.slice(e.off, e.off + 24))) return { ok: false, reason: 'rewritten xref invalid' };
+  if (modern) {
+    const back = readXrefChain(out, ot);
+    if (!back) return { ok: false, reason: 'rewritten xref invalid' };
+    for (const [n, e] of expected) { const g = back.entries.get(n); if (!g || g.type !== 1 || g.a !== e.off) return { ok: false, reason: 'rewritten xref invalid' }; }
+    for (const [n, e] of entries) if (e.type === 2 && offsets.has(e.a)) { const g = back.entries.get(n); if (!g || g.type !== 2 || g.a !== e.a || g.b !== e.b) return { ok: false, reason: 'rewritten xref invalid' }; }
+  }
   fs.writeFileSync(outPath, out);
   return { ok: true, size: out.length };
 }
@@ -477,17 +661,127 @@ async function psdShrink(job, outPath) {
   return { ok: true, size: out.length };
 }
 
+
+function tiffShrink(job, outPath) {
+  const st = fs.statSync(job.inPath);
+  if (st.size > 800 * MB) return { ok: false, reason: 'tiff too large to rewrite' };
+  const b = fs.readFileSync(job.inPath), bo = b.toString('latin1', 0, 2);
+  if ((bo !== 'II' && bo !== 'MM') || b.length < 16) return { ok: false, reason: 'tiff structure not supported' };
+  const le = bo === 'II';
+  const r16 = o => le ? b.readUInt16LE(o) : b.readUInt16BE(o), r32 = o => le ? b.readUInt32LE(o) : b.readUInt32BE(o);
+  const w16 = (buf, v, o) => le ? buf.writeUInt16LE(v, o) : buf.writeUInt16BE(v, o), w32 = (buf, v, o) => le ? buf.writeUInt32LE(v >>> 0, o) : buf.writeUInt32BE(v >>> 0, o);
+  if (r16(2) !== 42) return { ok: false, reason: 'tiff structure not supported' };   // BigTIFF etc.
+  const TS = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4 };
+  const ifds = [], seen = new Set();
+  let off = r32(4);
+  while (off) {
+    if (seen.has(off) || seen.size > 500 || off + 2 > b.length) return { ok: false, reason: 'tiff structure not supported' };
+    seen.add(off);
+    const n = r16(off), ents = [];
+    if (off + 2 + n * 12 + 4 > b.length) return { ok: false, reason: 'tiff structure not supported' };
+    for (let i = 0; i < n; i++) {
+      const e = off + 2 + i * 12, tag = r16(e), type = r16(e + 2), count = r32(e + 4), sz = TS[type];
+      if (!sz) return { ok: false, reason: 'tiff structure not supported' };
+      const total = sz * count, vo = total <= 4 ? e + 8 : r32(e + 8);
+      if (vo + total > b.length) return { ok: false, reason: 'tiff structure not supported' };
+      if ([330, 34665, 34853, 40965, 513].includes(tag)) return { ok: false, reason: 'tiff structure not supported' };
+      ents.push({ tag, type, count, data: b.subarray(vo, vo + total) });
+    }
+    ifds.push(ents); off = r32(off + 2 + n * 12);
+  }
+  const num = (ents, tag, d) => { const e = ents.find(x => x.tag === tag); if (!e || !e.count) return d; return e.type === 3 ? (le ? e.data.readUInt16LE(0) : e.data.readUInt16BE(0)) : (le ? e.data.readUInt32LE(0) : e.data.readUInt32BE(0)); };
+  const arr = e => { const sz = e.type === 3 ? 2 : 4, out = []; for (let i = 0; i < e.count; i++) out.push(sz === 2 ? (le ? e.data.readUInt16LE(i * 2) : e.data.readUInt16BE(i * 2)) : (le ? e.data.readUInt32LE(i * 4) : e.data.readUInt32BE(i * 4))); return out; };
+  const rd = (buf, o, w) => w === 2 ? (le ? buf.readUInt16LE(o) : buf.readUInt16BE(o)) : buf[o];
+  const wr = (buf, v, o, w) => { if (w === 2) w16(buf, v & 0xFFFF, o); else buf[o] = v & 255; };
+
+  const parts = [Buffer.alloc(8)]; let cur = 8, changedAny = false;
+  parts[0].write(bo, 0, 'latin1'); w16(parts[0], 42, 2);
+  const push = buf => { if (cur % 2) { parts.push(Buffer.alloc(1)); cur++; } const at = cur; parts.push(buf); cur += buf.length; return at; };
+  let patchPrev = 4;
+
+  for (const ents of ifds) {
+    const tiled = ents.some(e => e.tag === 324);
+    const oE = ents.find(e => e.tag === (tiled ? 324 : 273)), cE = ents.find(e => e.tag === (tiled ? 325 : 279));
+    if (!oE || !cE || oE.count !== cE.count) return { ok: false, reason: 'tiff structure not supported' };
+    const offs = arr(oE), cnts = arr(cE), comp = num(ents, 259, 1);
+    const width = tiled ? num(ents, 322, 0) : num(ents, 256, 0), spp = num(ents, 277, 1), planar = num(ents, 284, 1), sfmt = num(ents, 339, 1);
+    const bpsE = ents.find(e => e.tag === 258), bps = bpsE ? arr(bpsE) : [1];
+    const bytesPer = bps.every(v => v === bps[0]) ? bps[0] / 8 : 0;
+    const usePred = comp === 1 && planar === 1 && sfmt === 1 && (bytesPer === 1 || bytesPer === 2) && width > 0 && num(ents, 317, 1) === 1;
+    const rowBytes = width * spp * bytesPer;
+    let blocks = offs.map((o, i) => b.subarray(o, o + cnts[i]));
+    if (blocks.some((x, i) => offs[i] + cnts[i] > b.length || x.length !== cnts[i])) return { ok: false, reason: 'tiff structure not supported' };
+    let converted = false, newBlocks = blocks;
+    if (comp === 1) {
+      const zs = blocks.map(raw => {
+        const pred = usePred && raw.length % rowBytes === 0;
+        let src = raw;
+        if (pred) {
+          src = Buffer.from(raw);
+          for (let r = 0; r < raw.length; r += rowBytes) for (let j = (rowBytes / bytesPer) - 1; j >= spp; j--) wr(src, rd(raw, r + j * bytesPer, bytesPer) - rd(raw, r + (j - spp) * bytesPer, bytesPer), r + j * bytesPer, bytesPer);
+        }
+        const z = zlib.deflateSync(src, { level: 9 });
+        const back = zlib.inflateSync(z);
+        if (pred) for (let r = 0; r < back.length; r += rowBytes) for (let j = spp; j < rowBytes / bytesPer; j++) wr(back, rd(back, r + j * bytesPer, bytesPer) + rd(back, r + (j - spp) * bytesPer, bytesPer), r + j * bytesPer, bytesPer);
+        if (!back.equals(raw)) throw new Error('tiff self-check failed');
+        return { z, pred };
+      });
+      const allPred = zs.every(x => x.pred), anyPred = zs.some(x => x.pred);
+      if (anyPred && !allPred) { 
+        newBlocks = blocks.map(raw => zlib.deflateSync(raw, { level: 9 }));
+        newBlocks.usePred = false;
+      } else { newBlocks = zs.map(x => x.z); newBlocks.usePred = allPred; }
+      const before = blocks.reduce((s, x) => s + x.length, 0), after = newBlocks.reduce((s, x) => s + x.length, 0);
+      if (after < before * 0.97) { converted = true; changedAny = true; } else newBlocks = blocks;
+    }
+    const newOffs = newBlocks.map(blk => push(blk));
+    const out = [];
+    for (const e of ents) {
+      if (e.tag === (tiled ? 324 : 273) || e.tag === (tiled ? 325 : 279)) continue;
+      if (converted && (e.tag === 259 || e.tag === 317)) continue;
+      out.push(e);
+    }
+    const mkLong = vals => { const d = Buffer.alloc(vals.length * 4); vals.forEach((v, i) => w32(d, v, i * 4)); return { type: 4, count: vals.length, data: d }; };
+    out.push({ tag: tiled ? 324 : 273, ...mkLong(newOffs) }, { tag: tiled ? 325 : 279, ...mkLong(newBlocks.map(x => x.length)) });
+    if (converted) {
+      const s = v => { const d = Buffer.alloc(2); w16(d, v, 0); return { type: 3, count: 1, data: d }; };
+      out.push({ tag: 259, ...s(8) });
+      if (newBlocks.usePred) out.push({ tag: 317, ...s(2) });
+    }
+    out.sort((p, q) => p.tag - q.tag);
+    const valOffs = out.map(e => e.data.length > 4 ? push(Buffer.from(e.data)) : 0);
+    const dir = Buffer.alloc(2 + out.length * 12 + 4);
+    w16(dir, out.length, 0);
+    out.forEach((e, i) => {
+      const p = 2 + i * 12;
+      w16(dir, e.tag, p); w16(dir, e.type, p + 2); w32(dir, e.count, p + 4);
+      if (e.data.length > 4) w32(dir, valOffs[i], p + 8); else e.data.copy(dir, p + 8);
+    });
+    if (cur % 2) { parts.push(Buffer.alloc(1)); cur++; }
+    const dirAt = cur;
+    if (patchPrev === 4) w32(parts[0], dirAt, 4);
+    else { const prevDir = patchPrev; w32(prevDir.buf, dirAt, prevDir.pos); }
+    push(dir);
+    patchPrev = { buf: dir, pos: 2 + out.length * 12 };
+  }
+  if (!changedAny) return { ok: false, reason: 'already small' };
+  const out = Buffer.concat(parts);
+  fs.writeFileSync(outPath, out);
+  return { ok: true, size: out.length };
+}
+
 const running = new Set();
 function cancelAll() { for (const p of running) { try { p.kill(); } catch (_) { /* ignore */ } } }
 
 async function compress(job) {
   if (!NATIVE.has(job.ext)) return { ok: false, reason: 'unsupported' };
+  if (job.lossless && (VIDEO.has(job.ext) || AUDIO.has(job.ext) || IMAGE.has(job.ext)) && job.ext !== 'flac') return { ok: false, reason: 'lossless unsupported' };
   if (!(await available())) return { ok: false, reason: 'unavailable' };
   fs.mkdirSync(job.tmpDir, { recursive: true });
   const outPath = path.join(job.tmpDir, job.outName);
   let r;
   try {
-    r = job.ext === 'pdf' ? await pdfShrink(job, outPath, running) : job.ext === 'psd' ? await psdShrink(job, outPath) : await compressWithFfmpeg(job, outPath, job.onProgress, running);
+    r = job.ext === 'pdf' ? await pdfShrink(job, outPath, running) : job.ext === 'psd' ? await psdShrink(job, outPath) : (job.ext === 'tif' || job.ext === 'tiff') ? tiffShrink(job, outPath) : await compressWithFfmpeg(job, outPath, job.onProgress, running);
   } catch (e) { r = { ok: false, reason: String((e && e.message) || e).slice(0, 200) }; }
   if (r.ok && r.size >= fs.statSync(job.inPath).size) r = { ok: false, reason: 'not smaller' };
   if (!r.ok) { try { fs.unlinkSync(outPath); } catch (_) { /* ignore */ } return r; }
