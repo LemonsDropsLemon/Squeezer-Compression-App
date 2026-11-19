@@ -85,6 +85,7 @@ function recipe(ext, qName, info, threads, withSubs) {
 
   const isVideo = VIDEO.has(ext) && info.hasVideo;
   if (!isVideo) {
+
     if (!info.hasAudio) return { skip: 'no audio or video stream' };
     const kb = { mp3: P.mp3, m4a: P.aac, m4b: P.aac, aac: P.aac, opus: P.opus, wma: P.aac, mka: P.opus }[ext] || P.aac;
     if (['mp3', 'm4a', 'm4b', 'aac', 'opus', 'wma'].includes(ext) && info.bitrate && info.bitrate <= kb * 1.05) return { skip: 'already small' };
@@ -199,7 +200,6 @@ function ffJpeg(input, inArgs, outArgs) {
     p.stdin.end(input);
   });
 }
-
 function jpegInfo(b) {
   if (b.length < 4 || b[0] !== 0xFF || b[1] !== 0xD8) return null;
   let i = 2;
@@ -227,7 +227,7 @@ function balancedDict(txt, from) {
     else i++;
   }
   return null;
-
+}
 function removeKey(d, key) {
   const k = d.indexOf(key); if (k < 0) return d;
   let i = k + key.length; while (/\s/.test(d[i])) i++;
@@ -258,7 +258,7 @@ function pngUnfilter(data, columns, colors, bpc) {
     }
   }
   return out;
-
+}
 function decodeFlate(raw, dict) {
   let data; try { data = zlibMod.inflateSync(raw); } catch (_) { return null; }
   const pm = /\/Predictor\s+(\d+)/.exec(dict);
@@ -504,6 +504,7 @@ async function pdfShrink(job, outPath, procs) {
     expected.set(topNum, { off: xrefAt, gen: 0 });
   }
   const out = Buffer.concat(parts);
+
   const ot = out.toString('latin1');
   for (const [n, e] of expected) if (!new RegExp('^' + n + '[ \\t]+' + e.gen + '[ \\t]+obj').test(ot.slice(e.off, e.off + 24))) return { ok: false, reason: 'rewritten xref invalid' };
   if (modern) {
@@ -661,7 +662,6 @@ async function psdShrink(job, outPath) {
   return { ok: true, size: out.length };
 }
 
-
 function tiffShrink(job, outPath) {
   const st = fs.statSync(job.inPath);
   if (st.size > 800 * MB) return { ok: false, reason: 'tiff too large to rewrite' };
@@ -670,7 +670,7 @@ function tiffShrink(job, outPath) {
   const le = bo === 'II';
   const r16 = o => le ? b.readUInt16LE(o) : b.readUInt16BE(o), r32 = o => le ? b.readUInt32LE(o) : b.readUInt32BE(o);
   const w16 = (buf, v, o) => le ? buf.writeUInt16LE(v, o) : buf.writeUInt16BE(v, o), w32 = (buf, v, o) => le ? buf.writeUInt32LE(v >>> 0, o) : buf.writeUInt32BE(v >>> 0, o);
-  if (r16(2) !== 42) return { ok: false, reason: 'tiff structure not supported' };   // BigTIFF etc.
+  if (r16(2) !== 42) return { ok: false, reason: 'tiff structure not supported' };
   const TS = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4 };
   const ifds = [], seen = new Set();
   let off = r32(4);
@@ -727,7 +727,7 @@ function tiffShrink(job, outPath) {
         return { z, pred };
       });
       const allPred = zs.every(x => x.pred), anyPred = zs.some(x => x.pred);
-      if (anyPred && !allPred) { 
+      if (anyPred && !allPred) {
         newBlocks = blocks.map(raw => zlib.deflateSync(raw, { level: 9 }));
         newBlocks.usePred = false;
       } else { newBlocks = zs.map(x => x.z); newBlocks.usePred = allPred; }
@@ -772,8 +772,501 @@ function tiffShrink(job, outPath) {
 
 const running = new Set();
 function cancelAll() { for (const p of running) { try { p.kill(); } catch (_) { /* ignore */ } } }
+const LOSSLESS_NATIVE = new Set(['png', 'jpg', 'jpeg']);
+
+const crcTable = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c; }
+  return t;
+})();
+function crc32(...bufs) {
+  let c = -1;
+  for (const b of bufs) for (let i = 0; i < b.length; i++) c = crcTable[(c ^ b[i]) & 255] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+
+// ---- PNG
+const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const PNG_DROP = new Set(['tEXt', 'zTXt', 'iTXt', 'tIME']);
+const PNG_CHANNELS = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+
+function pngChunk(type, data) {
+  const head = Buffer.alloc(8); head.writeUInt32BE(data.length, 0); head.write(type, 4, 'latin1');
+  const tail = Buffer.alloc(4); tail.writeUInt32BE(crc32(head.subarray(4), data), 0);
+  return Buffer.concat([head, data, tail]);
+}
+function unfilterPng(raw, h, rb, st) {
+  const pix = Buffer.alloc(h * rb);
+  for (let y = 0; y < h; y++) {
+    const f = raw[y * (rb + 1)], s = y * (rb + 1) + 1, o = y * rb, p = o - rb;
+    if (f === 0) { raw.copy(pix, o, s, s + rb); }
+    else if (f === 1) { for (let i = 0; i < rb; i++) pix[o + i] = (raw[s + i] + (i >= st ? pix[o + i - st] : 0)) & 255; }
+    else if (f === 2) { for (let i = 0; i < rb; i++) pix[o + i] = (raw[s + i] + (y ? pix[p + i] : 0)) & 255; }
+    else if (f === 3) { for (let i = 0; i < rb; i++) pix[o + i] = (raw[s + i] + (((i >= st ? pix[o + i - st] : 0) + (y ? pix[p + i] : 0)) >> 1)) & 255; }
+    else if (f === 4) {
+      for (let i = 0; i < rb; i++) {
+        const a = i >= st ? pix[o + i - st] : 0, b = y ? pix[p + i] : 0, c = (i >= st && y) ? pix[p + i - st] : 0;
+        const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c);
+        pix[o + i] = (raw[s + i] + ((pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c))) & 255;
+      }
+    } else return null;
+  }
+  return pix;
+}
+function refilterPng(pix, h, rb, st) {
+  const out = Buffer.alloc(h * (rb + 1)), zero = Buffer.alloc(rb);
+  const cand = [0, 1, 2, 3, 4].map(() => Buffer.alloc(rb));
+  const mag = v => (v < 128 ? v : 256 - v);
+  for (let y = 0; y < h; y++) {
+    const o = y * rb, row = pix.subarray(o, o + rb), up = y ? pix.subarray(o - rb, o) : zero;
+    const sums = [0, 0, 0, 0, 0];
+    const c0 = cand[0], c1 = cand[1], c2 = cand[2], c3 = cand[3], c4 = cand[4];
+    for (let i = 0; i < rb; i++) {
+      const x = row[i], a = i >= st ? row[i - st] : 0, b = up[i], c = i >= st ? up[i - st] : 0;
+      const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c);
+      c0[i] = x; c1[i] = (x - a) & 255; c2[i] = (x - b) & 255; c3[i] = (x - ((a + b) >> 1)) & 255;
+      c4[i] = (x - ((pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c))) & 255;
+      sums[0] += mag(c0[i]); sums[1] += mag(c1[i]); sums[2] += mag(c2[i]); sums[3] += mag(c3[i]); sums[4] += mag(c4[i]);
+    }
+    let best = 0;
+    for (let f = 1; f < 5; f++) if (sums[f] < sums[best]) best = f;
+    out[y * (rb + 1)] = best; cand[best].copy(out, y * (rb + 1) + 1);
+  }
+  return out;
+}
+function noFilterPng(pix, h, rb) {
+  const out = Buffer.alloc(h * (rb + 1));
+  for (let y = 0; y < h; y++) pix.copy(out, y * (rb + 1) + 1, y * rb, (y + 1) * rb);
+  return out;
+}
+function smallestDeflate(raws) {
+  let best = null;
+  for (const r of raws) {
+    for (const strategy of [zlibMod.constants.Z_DEFAULT_STRATEGY, zlibMod.constants.Z_FILTERED]) {
+      const z = zlibMod.deflateSync(r.data, { level: 9, memLevel: 9, strategy });
+      if (!best || z.length < best.z.length) best = { z, tag: r.tag, data: r.data };
+    }
+  }
+  return best;
+}
+function pngToRgba(ctype, depth, pix, w, h, plte, trns) {
+  const out = Buffer.alloc(w * h * 4), rb = Math.ceil(w * (PNG_CHANNELS[ctype] * depth) / 8), mask = (1 << depth) - 1;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const d = (y * w + x) * 4;
+      if (ctype === 2 || ctype === 6) {
+        const s = y * rb + x * (ctype === 2 ? 3 : 4);
+        out[d] = pix[s]; out[d + 1] = pix[s + 1]; out[d + 2] = pix[s + 2]; out[d + 3] = ctype === 6 ? pix[s + 3] : 255;
+      } else if (ctype === 4) {
+        const s = y * rb + x * 2; out[d] = out[d + 1] = out[d + 2] = pix[s]; out[d + 3] = pix[s + 1];
+      } else {
+        const bit = x * depth, v = (pix[y * rb + (bit >> 3)] >> (8 - depth - (bit & 7))) & mask;
+        if (ctype === 0) { const g = depth === 8 ? v : Math.round(v * 255 / mask); out[d] = out[d + 1] = out[d + 2] = g; out[d + 3] = 255; }
+        else { out[d] = plte[v * 3]; out[d + 1] = plte[v * 3 + 1]; out[d + 2] = plte[v * 3 + 2]; out[d + 3] = trns && v < trns.length ? trns[v] : 255; }
+      }
+    }
+  }
+  return out;
+}
+function pngConvert(pix, w, h, ctype, allowGrey) {
+  const px = ctype === 6 ? 4 : 3, colors = new Map();
+  let opaque = true, grey = true, tooMany = false;
+  for (let y = 0; y < h; y++) {
+    let s = y * w * px;
+    for (let x = 0; x < w; x++, s += px) {
+      const r = pix[s], g = pix[s + 1], b = pix[s + 2], a = px === 4 ? pix[s + 3] : 255;
+      if (a !== 255) opaque = false;
+      if (r !== g || g !== b) grey = false;
+      if (!tooMany) {
+        const k = ((r * 256 + g) * 256 + b) * 256 + a;
+        if (!colors.has(k)) { if (colors.size >= 256) tooMany = true; else colors.set(k, 0); }
+      }
+    }
+  }
+  if (!tooMany) {
+    const keys = [...colors.keys()].map(k => ({ k, a: k % 256 })).sort((p, q) => (p.a === 255) - (q.a === 255));
+    const n = keys.length, depth = n <= 2 ? 1 : n <= 4 ? 2 : n <= 16 ? 4 : 8;
+    keys.forEach((e, i) => colors.set(e.k, i));
+    const plte = Buffer.alloc(n * 3);
+    let translucent = 0;
+    keys.forEach((e, i) => {
+      const k = e.k, a = k % 256, b = Math.floor(k / 256) % 256, g = Math.floor(k / 65536) % 256, r = Math.floor(k / 16777216);
+      plte[i * 3] = r; plte[i * 3 + 1] = g; plte[i * 3 + 2] = b; if (a !== 255) translucent = i + 1;
+    });
+    const trns = translucent ? Buffer.from(keys.slice(0, translucent).map(e => e.a)) : null;
+    const rb = Math.ceil(w * depth / 8), rows = Buffer.alloc(h * rb);
+    for (let y = 0; y < h; y++) {
+      let s = y * w * px;
+      for (let x = 0; x < w; x++, s += px) {
+        const a = px === 4 ? pix[s + 3] : 255, idx = colors.get(((pix[s] * 256 + pix[s + 1]) * 256 + pix[s + 2]) * 256 + a), bit = x * depth;
+        rows[y * rb + (bit >> 3)] |= idx << (8 - depth - (bit & 7));
+      }
+    }
+    if (!(depth === 8 && grey && allowGrey && !trns)) return { ctype: 3, depth, rows, plte, trns };
+  }
+  if (grey && allowGrey) {
+    const gp = ctype === 6 && !opaque ? 2 : 1, rows = Buffer.alloc(w * h * gp);
+    for (let i = 0, s = 0, d = 0; i < w * h; i++, s += px) { rows[d++] = pix[s]; if (gp === 2) rows[d++] = pix[s + 3]; }
+    return { ctype: gp === 2 ? 4 : 0, depth: 8, rows, plte: null, trns: null };
+  }
+  if (ctype === 6 && opaque) {
+    const rows = Buffer.alloc(w * h * 3);
+    for (let i = 0, s = 0, d = 0; i < w * h; i++, s += 4) { rows[d++] = pix[s]; rows[d++] = pix[s + 1]; rows[d++] = pix[s + 2]; }
+    return { ctype: 2, depth: 8, rows, plte: null, trns: null };
+  }
+  return null;
+}
+function pngOptimize(buf) {
+  if (buf.length < 57 || !buf.subarray(0, 8).equals(PNG_SIG)) return 'unsupported';
+  const chunks = [];
+  for (let pos = 8; pos + 12 <= buf.length;) {
+    const len = buf.readUInt32BE(pos), type = buf.toString('latin1', pos + 4, pos + 8);
+    if (pos + 12 + len > buf.length) return 'unsupported';
+    chunks.push({ type, data: buf.subarray(pos + 8, pos + 8 + len) });
+    pos += 12 + len;
+    if (type === 'IEND') break;
+  }
+  if (chunks.length < 3 || chunks[0].type !== 'IHDR' || chunks[chunks.length - 1].type !== 'IEND') return 'unsupported';
+  if (chunks.some(c => c.type === 'acTL' || c.type === 'fdAT')) return 'unsupported';   // animated PNG
+  const ih = chunks[0].data, w = ih.readUInt32BE(0), h = ih.readUInt32BE(4), depth = ih[8], ctype = ih[9], interlaced = ih[12] !== 0;
+  const channels = PNG_CHANNELS[ctype];
+  if (!channels || !w || !h || ih[10] || ih[11]) return 'unsupported';
+  const bits = channels * depth, rb = Math.ceil(w * bits / 8), st = Math.max(1, bits >> 3);
+  if (w * h * channels * depth / 8 > 400 * MB) return 'too big';
+
+  const idats = chunks.filter(c => c.type === 'IDAT');
+  if (!idats.length) return 'unsupported';
+  let raw;
+  try { raw = zlibMod.inflateSync(Buffer.concat(idats.map(c => c.data))); } catch (_) { return 'unsupported'; }
+  const origIdat = idats.reduce((n, c) => n + c.data.length, 0);
+
+  const firstIdat = chunks.findIndex(c => c.type === 'IDAT');
+  const has = t => chunks.some(c => c.type === t);
+  const kept = chunks.map((c, i) => ({ c, i })).filter(({ c }) => !['IHDR', 'IDAT', 'IEND'].includes(c.type) && !PNG_DROP.has(c.type));
+  const pre = kept.filter(({ i }) => i < firstIdat).map(({ c }) => c), post = kept.filter(({ i }) => i > firstIdat).map(({ c }) => c);
+  const plain = pre.filter(c => c.type !== 'PLTE' && c.type !== 'tRNS');
+
+  const cands = [];
+  let pix = null;
+  if (!interlaced) {
+    if (raw.length !== h * (rb + 1)) return 'unsupported';
+    pix = unfilterPng(raw, h, rb, st);
+    if (!pix) return 'unsupported';
+  }
+  const rawSets = [{ tag: 'orig', data: raw }];
+  if (pix && raw.length <= 96 * MB) {
+    rawSets.push({ tag: 'adaptive', data: refilterPng(pix, h, rb, st) });
+    if (ctype === 3 || depth < 8) rawSets.push({ tag: 'none', data: noFilterPng(pix, h, rb) });
+  }
+  const bestSame = smallestDeflate(rawSets);
+  cands.push({ z: bestSame.z, ctype, depth, plte: null, trns: null, same: true, pix, raw: bestSame.data });
+  cands.push({ z: Buffer.concat(idats.map(c => c.data)), ctype, depth, plte: null, trns: null, same: true, pix, raw });
+
+  const tied = ['bKGD', 'hIST', 'sBIT', 'sPLT'].some(has) || (ctype === 2 && has('tRNS'));
+  if (pix && depth === 8 && (ctype === 2 || ctype === 6) && !tied && w * h <= 64e6) {
+    const cv = pngConvert(pix, w, h, ctype, !has('iCCP'));
+    if (cv) {
+      const nrb = Math.ceil(w * PNG_CHANNELS[cv.ctype] * cv.depth / 8);
+      const sets = [{ tag: 'adaptive', data: refilterPng(cv.rows, h, nrb, Math.max(1, (PNG_CHANNELS[cv.ctype] * cv.depth) >> 3)) }];
+      if (cv.ctype === 3 || cv.depth < 8) sets.push({ tag: 'none', data: noFilterPng(cv.rows, h, nrb) });
+      const b = smallestDeflate(sets);
+      cands.push({ z: b.z, ctype: cv.ctype, depth: cv.depth, plte: cv.plte, trns: cv.trns, same: false, pix: cv.rows, raw: b.data, nrb });
+    }
+  }
+  cands.sort((a, b) => a.z.length - b.z.length);
+  const win = cands[0];
+
+  if (win.same) {
+    if (pix) { const back = unfilterPng(zlibMod.inflateSync(win.z), h, rb, st); if (!back || !back.equals(pix)) return 'unsupported'; }
+    else if (!zlibMod.inflateSync(win.z).equals(raw)) return 'unsupported';
+  } else {
+    const back = unfilterPng(zlibMod.inflateSync(win.z), h, win.nrb, Math.max(1, (PNG_CHANNELS[win.ctype] * win.depth) >> 3));
+    const a = pngToRgba(ctype, 8, pix, w, h, null, null);
+    const b = back && pngToRgba(win.ctype, win.depth, back, w, h, win.plte, win.trns);
+    if (!b || !a.equals(b)) return 'unsupported';
+  }
+
+  const head = Buffer.from(ih);
+  if (!win.same) { head[8] = win.depth; head[9] = win.ctype; }
+  const parts = [PNG_SIG, pngChunk('IHDR', head)];
+  if (win.same) { for (const c of pre) parts.push(pngChunk(c.type, c.data)); }
+  else {
+    for (const c of plain) parts.push(pngChunk(c.type, c.data));
+    if (win.plte) { parts.push(pngChunk('PLTE', win.plte)); if (win.trns) parts.push(pngChunk('tRNS', win.trns)); }
+  }
+  parts.push(pngChunk('IDAT', win.z));
+  for (const c of post) parts.push(pngChunk(c.type, c.data));
+  parts.push(pngChunk('IEND', Buffer.alloc(0)));
+  const outBuf = Buffer.concat(parts);
+  return outBuf.length < buf.length ? outBuf : 'not smaller';
+}
+
+const JPEG_DROP_APP = new Set([0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEF]);
+function jpegKeepSegment(m, body) {
+  if (m === 0xFE) return false;
+  if (JPEG_DROP_APP.has(m)) return false;
+  if (m === 0xE1) return !body.subarray(0, 29).toString('latin1').startsWith('http://ns.adobe.com/xap/');
+  if (m === 0xE2) return body.subarray(0, 12).toString('latin1') === 'ICC_PROFILE\0';
+  return true;
+}
+function buildHuffDecoder(bits, vals) {
+  const look = new Uint16Array(65536);
+  let code = 0, k = 0;
+  for (let len = 1; len <= 16; len++) {
+    for (let i = 0; i < bits[len - 1]; i++, k++, code++) {
+      const lo = code << (16 - len), hi = (code + 1) << (16 - len);
+      if (hi > 65536) throw new Error('bad table');
+      look.fill((len << 8) | vals[k], lo, hi);
+    }
+    code <<= 1;
+  }
+  return look;
+}
+function jpegDecodeScan(buf, start, frame, ri, sc, decoders) {
+  const nSc = sc.comps.length, ev = { a: new Uint32Array(1 << 16), n: 0 };
+  const push = v => { if (ev.n === ev.a.length) { const t = new Uint32Array(ev.a.length * 2); t.set(ev.a); ev.a = t; } ev.a[ev.n++] = v; };
+  let pos = start, bb = 0, bc = 0, fake = 0, hit = false;
+  const fill = () => {
+    while (bc <= 24) {
+      let byte = 0;
+      if (!hit && pos < buf.length) {
+        byte = buf[pos];
+        if (byte === 0xFF) { if (buf[pos + 1] === 0) pos += 2; else { hit = true; byte = 0; fake += 8; } } else pos++;
+      } else fake += 8;
+      bb = (bb << 8) | byte; bc += 8;
+    }
+  };
+  const hmax = Math.max(...frame.comps.map(c => c.h)), vmax = Math.max(...frame.comps.map(c => c.v));
+  let blocks = [], total;
+  if (nSc > 1) {
+    for (const c of sc.comps) for (let i = 0; i < c.h * c.v; i++) blocks.push(c);
+    total = Math.ceil(frame.w / (8 * hmax)) * Math.ceil(frame.h / (8 * vmax));
+  } else {
+    const c = sc.comps[0];
+    blocks = [c];
+    total = Math.ceil(Math.ceil(frame.w * c.h / hmax) / 8) * Math.ceil(Math.ceil(frame.h * c.v / vmax) / 8);
+  }
+  const sym = (look) => {
+    if (bc < 16) fill();
+    const e = look[(bb >>> (bc - 16)) & 0xFFFF];
+    if (!e) throw new Error('bad code');
+    bc -= e >> 8; return e & 255;
+  };
+  const bitsOf = (n) => { if (bc < 16) fill(); const v = (bb >>> (bc - n)) & ((1 << n) - 1); bc -= n; return v; };
+  const checkEnd = () => {
+    if (bc < fake || bc - fake >= 8) throw new Error('trailing data');
+    if (!(buf[pos] === 0xFF && pos + 1 < buf.length && buf[pos + 1] !== 0)) throw new Error('not at marker');
+  };
+  let rst = 0;
+  for (let m = 0; m < total; m++) {
+    for (const c of blocks) {
+      const dt = c.td, at = 4 + c.ta;
+      const s = sym(decoders[dt]);
+      if (s > 11) throw new Error('bad dc');
+      push((dt << 23) | (s << 15) | (s << 11) | (s ? bitsOf(s) : 0));
+      for (let k = 1; k < 64;) {
+        const rs = sym(decoders[at]), r = rs >> 4, z = rs & 15;
+        if (z === 0) {
+          push((at << 23) | (rs << 15));
+          if (r === 15) { k += 16; continue; }
+          break;
+        }
+        if (z > 10) throw new Error('bad ac');
+        k += r; if (k > 63) throw new Error('bad run');
+        push((at << 23) | (rs << 15) | (z << 11) | bitsOf(z));
+        k++;
+      }
+    }
+    if (ri && (m + 1) % ri === 0 && m + 1 < total) {
+      checkEnd();
+      if (buf[pos + 1] !== 0xD0 + (rst & 7)) throw new Error('missing restart');
+      pos += 2; rst++; bb = 0; bc = 0; fake = 0; hit = false;
+      push(15 << 23);
+    }
+  }
+  checkEnd();
+  return { events: ev.a.subarray(0, ev.n), end: pos };
+}
+function optimalHuffman(freqIn) {
+  const freq = new Float64Array(257); for (let i = 0; i < 256; i++) freq[i] = freqIn[i]; freq[256] = 1;
+  const size = new Int32Array(257), others = new Int32Array(257).fill(-1);
+  for (;;) {
+    let c1 = -1, v = Infinity;
+    for (let i = 0; i <= 256; i++) if (freq[i] && freq[i] <= v) { v = freq[i]; c1 = i; }
+    let c2 = -1; v = Infinity;
+    for (let i = 0; i <= 256; i++) if (freq[i] && freq[i] <= v && i !== c1) { v = freq[i]; c2 = i; }
+    if (c2 < 0) break;
+    freq[c1] += freq[c2]; freq[c2] = 0;
+    size[c1]++; while (others[c1] >= 0) { c1 = others[c1]; size[c1]++; }
+    others[c1] = c2;
+    size[c2]++; while (others[c2] >= 0) { c2 = others[c2]; size[c2]++; }
+  }
+  const bits = new Int32Array(64);
+  for (let i = 0; i <= 256; i++) if (size[i]) { if (size[i] > 62) throw new Error('code too long'); bits[size[i]]++; }
+  for (let i = 62; i > 16; i--) {
+    while (bits[i] > 0) { let j = i - 2; while (bits[j] === 0) j--; bits[i] -= 2; bits[i - 1]++; bits[j + 1] += 2; bits[j]--; }
+  }
+  let i = 16; while (bits[i] === 0) i--; bits[i]--;
+  const vals = [];
+  for (let len = 1; len <= 62; len++) for (let s = 0; s < 256; s++) if (size[s] === len) vals.push(s);
+  return { bits: Buffer.from(Array.from(bits.subarray(1, 17))), vals: Buffer.from(vals) };
+}
+function parseJpeg(buf) {
+  if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) throw new Error('not jpeg');
+  let pos = 2, frame = null, ri = 0, sawScan = false, sawEoi = false;
+  const items = [], tables = {}, decoders = {};
+  while (pos < buf.length) {
+    if (buf[pos] !== 0xFF) throw new Error('bad marker');
+    while (buf[pos + 1] === 0xFF) pos++;
+    const m = buf[pos + 1];
+    if (m === 0xD9) { pos += 2; sawEoi = true; break; }
+    if (m === 0x00 || m === 0x01 || (m >= 0xD0 && m <= 0xD8)) throw new Error('unexpected marker');
+    const len = buf.readUInt16BE(pos + 2), end = pos + 2 + len;
+    if (len < 2 || end > buf.length) throw new Error('bad length');
+    const body = buf.subarray(pos + 4, end);
+    if (m === 0xC4) {
+      for (let o = 0; o < body.length;) {
+        const cls = body[o] >> 4, id = body[o] & 15;
+        if (cls > 1 || id > 3) throw new Error('bad dht');
+        const bits = body.subarray(o + 1, o + 17); let n = 0; for (const b of bits) n += b;
+        const vals = body.subarray(o + 17, o + 17 + n);
+        if (n > 256 || vals.length !== n) throw new Error('bad dht');
+        const key = cls * 4 + id;
+        if (sawScan && tables[key] && !(tables[key].bits.equals(bits) && tables[key].vals.equals(vals))) throw new Error('tables change between scans');
+        if (sawScan && !tables[key]) throw new Error('new table after scan');
+        tables[key] = { bits: Buffer.from(bits), vals: Buffer.from(vals) }; decoders[key] = null;
+        o += 17 + n;
+      }
+    } else if (m === 0xC0 || m === 0xC1) {
+      if (frame || body[0] !== 8) throw new Error('unsupported frame');
+      frame = { h: body.readUInt16BE(1), w: body.readUInt16BE(3), comps: [] };
+      for (let i = 0; i < body[5]; i++) frame.comps.push({ id: body[6 + i * 3], h: body[7 + i * 3] >> 4, v: body[7 + i * 3] & 15 });
+      if (!frame.h || !frame.w || !frame.comps.length || frame.comps.some(c => !c.h || !c.v)) throw new Error('bad frame');
+      items.push({ raw: buf.subarray(pos, end) });
+    } else if (m >= 0xC2 && m <= 0xCF) {
+      throw new Error('not baseline');
+    } else if (m === 0xDC) {
+      throw new Error('DNL');
+    } else if (m === 0xDD) {
+      ri = body.readUInt16BE(0); items.push({ raw: buf.subarray(pos, end) });
+    } else if (m === 0xDA) {
+      if (!frame) throw new Error('scan before frame');
+      const ns = body[0], comps = [];
+      for (let i = 0; i < ns; i++) {
+        const fc = frame.comps.find(c => c.id === body[1 + i * 2]);
+        if (!fc) throw new Error('bad scan component');
+        comps.push({ h: fc.h, v: fc.v, td: body[2 + i * 2] >> 4, ta: body[2 + i * 2] & 15 });
+      }
+      if (body[1 + ns * 2] !== 0 || body[2 + ns * 2] !== 63 || body[3 + ns * 2] !== 0) throw new Error('not sequential');
+      for (const c of comps) {
+        if (c.td > 3 || c.ta > 3 || !tables[c.td] || !tables[4 + c.ta]) throw new Error('missing table');
+        for (const k of [c.td, 4 + c.ta]) if (!decoders[k]) decoders[k] = buildHuffDecoder(tables[k].bits, tables[k].vals);
+      }
+      const r = jpegDecodeScan(buf, end, frame, ri, { comps }, decoders);
+      items.push({ scan: true, hdr: buf.subarray(pos, end), events: r.events });
+      sawScan = true; pos = r.end; continue;
+    } else if (jpegKeepSegment(m, body)) {
+      items.push({ raw: buf.subarray(pos, end) });
+    }
+    pos = end;
+  }
+  if (!sawEoi || !sawScan) throw new Error('incomplete');
+  if (pos !== buf.length) throw new Error('data after the end');
+  return { items, tables };
+}
+function jpegOptimize(buf) {
+  let p;
+  try { p = parseJpeg(buf); } catch (_) { return 'unsupported'; }
+  const freq = Array.from({ length: 8 }, () => new Float64Array(256));
+  for (const it of p.items) if (it.scan) for (const v of it.events) { const t = v >>> 23; if (t < 8) freq[t][(v >>> 15) & 255]++; }
+  const codes = {}, dht = [];
+  for (let slot = 0; slot < 8; slot++) {
+    if (!freq[slot].some(Boolean)) continue;
+    const orig = p.tables[slot];
+    if (!orig) return 'unsupported';
+    let t;
+    try { t = optimalHuffman(freq[slot]); } catch (_) { return 'unsupported'; }
+    const code = new Uint16Array(256), len = new Uint8Array(256);
+    let c = 0, k = 0;
+    for (let l = 1; l <= 16; l++) { for (let i = 0; i < t.bits[l - 1]; i++, k++, c++) { code[t.vals[k]] = c; len[t.vals[k]] = l; } c <<= 1; }
+    for (let s = 0; s < 256; s++) if (freq[slot][s] && !len[s]) return 'unsupported';
+    codes[slot] = { code, len };
+    dht.push(Buffer.concat([Buffer.from([(slot < 4 ? 0 : 0x10) | (slot & 3)]), t.bits, t.vals]));
+  }
+  const dhtBody = Buffer.concat(dht), dhtSeg = Buffer.alloc(4); dhtSeg[0] = 0xFF; dhtSeg[1] = 0xC4; dhtSeg.writeUInt16BE(dhtBody.length + 2, 2);
+
+  let out = Buffer.allocUnsafe(buf.length + 65536), n = 0, acc = 0, nb = 0;
+  const room = k => { if (n + k > out.length) { const t = Buffer.allocUnsafe(out.length * 2 + k); out.copy(t, 0, 0, n); out = t; } };
+  const put = b => { room(1); out[n++] = b; };
+  const write = (code, len) => {
+    acc = (acc << len) | code; nb += len;
+    while (nb >= 8) { const byte = (acc >>> (nb - 8)) & 255; put(byte); if (byte === 255) put(0); nb -= 8; }
+    acc &= (1 << nb) - 1;
+  };
+  const flushBits = () => { if (nb) write((1 << (8 - nb)) - 1, 8 - nb); };
+  const copy = b => { room(b.length); b.copy(out, n); n += b.length; };
+  put(0xFF); put(0xD8);
+  let wroteDht = false;
+  for (const it of p.items) {
+    if (it.raw) { copy(it.raw); continue; }
+    if (!wroteDht) { copy(dhtSeg); copy(dhtBody); wroteDht = true; }
+    copy(it.hdr);
+    let rst = 0;
+    for (const v of it.events) {
+      const t = v >>> 23;
+      if (t === 15) { flushBits(); put(0xFF); put(0xD0 + (rst++ & 7)); continue; }
+      const s = (v >>> 15) & 255, nbits = (v >>> 11) & 15, cd = codes[t];
+      write(cd.code[s], cd.len[s]);
+      if (nbits) write(v & ((1 << nbits) - 1), nbits);
+    }
+    flushBits();
+  }
+  put(0xFF); put(0xD9);
+  const res = out.subarray(0, n);
+  if (res.length >= buf.length) return 'not smaller';
+  try {
+    const back = parseJpeg(res), a = p.items.filter(i => i.scan), b = back.items.filter(i => i.scan);
+    if (a.length !== b.length) return 'unsupported';
+    for (let i = 0; i < a.length; i++) {
+      if (a[i].events.length !== b[i].events.length) return 'unsupported';
+      for (let j = 0; j < a[i].events.length; j++) if (a[i].events[j] !== b[i].events[j]) return 'unsupported';
+    }
+  } catch (_) { return 'unsupported'; }
+  return Buffer.from(res);
+}
+function ffmpegPictureHash(file) {
+  return new Promise(resolve => {
+    let out = '';
+    const p = spawn(ffmpegBin(), ['-v', 'error', '-nostdin', '-i', file, '-map', '0:v:0', '-pix_fmt', 'rgba', '-f', 'md5', '-'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    p.stdout.on('data', d => { out += d; });
+    p.on('error', () => resolve(null));
+    p.on('close', code => resolve(code === 0 ? out.trim() : null));
+  });
+}
+async function losslessPicture(job, outPath) {
+  const size = fs.statSync(job.inPath).size;
+  if (size > 300 * MB) return { ok: false, reason: 'too big' };
+  const input = fs.readFileSync(job.inPath);
+  const res = job.ext === 'png' ? pngOptimize(input) : jpegOptimize(input);
+  if (typeof res === 'string') return { ok: false, reason: res };
+  fs.writeFileSync(outPath, res);
+  if (await available()) {
+    const [a, b] = await Promise.all([ffmpegPictureHash(job.inPath), ffmpegPictureHash(outPath)]);
+    if (a && a !== b) return { ok: false, reason: 'unsupported' };
+  }
+  if (job.onProgress) job.onProgress(100);
+  return { ok: true, size: res.length };
+}
 
 async function compress(job) {
+  if (job.lossless && LOSSLESS_NATIVE.has(job.ext)) {
+    fs.mkdirSync(job.tmpDir, { recursive: true });
+    const outPath = path.join(job.tmpDir, job.outName);
+    let r;
+    try { r = await losslessPicture(job, outPath); } catch (e) { r = { ok: false, reason: String((e && e.message) || e).slice(0, 200) }; }
+    if (!r.ok) { try { fs.unlinkSync(outPath); } catch (_) { /* ignore */ } return r; }
+    return { ok: true, path: outPath, size: r.size };
+  }
   if (!NATIVE.has(job.ext)) return { ok: false, reason: 'unsupported' };
   if (job.lossless && (VIDEO.has(job.ext) || AUDIO.has(job.ext) || IMAGE.has(job.ext)) && job.ext !== 'flac') return { ok: false, reason: 'lossless unsupported' };
   if (!(await available())) return { ok: false, reason: 'unavailable' };
@@ -788,4 +1281,4 @@ async function compress(job) {
   return { ok: true, path: outPath, size: r.size };
 }
 
-module.exports = { NATIVE, VIDEO, AUDIO, IMAGE, available, compress, cancelAll, ffmpegBin, tmpRoot: () => path.join(os.tmpdir(), 'squeeze-' + process.pid) };
+module.exports = { NATIVE, LOSSLESS_NATIVE, VIDEO, AUDIO, IMAGE, available, compress, cancelAll, ffmpegBin, tmpRoot: () => path.join(os.tmpdir(), 'squeeze-' + process.pid) };
