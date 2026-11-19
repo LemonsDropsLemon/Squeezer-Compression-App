@@ -164,7 +164,7 @@ ipcMain.handle('native-ready', () => media.available());
 
 ipcMain.handle('native-compress', async (event, job) => {
   const ext = String((job && job.ext) || '').toLowerCase();
-  if (!job || !media.NATIVE.has(ext) || typeof job.path !== 'string' || !fs.existsSync(job.path)) {
+  if (!job || !(media.NATIVE.has(ext) || (job.mode === 'lossless' && media.LOSSLESS_NATIVE.has(ext))) || typeof job.path !== 'string' || !fs.existsSync(job.path)) {
     return { ok: false, reason: 'bad request' };
   }
   const id = Number(job.id) || 0;
