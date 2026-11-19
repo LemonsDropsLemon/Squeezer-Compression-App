@@ -31,12 +31,13 @@ All compression takes place locally on your device. Files are not uploaded to ex
 ---
 
 **Squeeze - Compress locally.**
-https://github.com/LemonsDropsLemon/Squeezer-Compression-App/releases/tag/1.0.0v
+
+<img width="760" height="1008" alt="Untitled-1" src="https://github.com/user-attachments/assets/b5a85ab2-4ff3-4c93-b442-132e374c2e3b" />
+
+## Display of it compressing a 1.5GB mp4
+
+https://github.com/user-attachments/assets/79db0858-197f-4a48-8e64-b6923d1ded2c
 
 
-<img width="761" height="688" alt="Screenshot 2026-11-17 115920" src="https://github.com/user-attachments/assets/0bda0357-54cb-4f10-9573-e1c583e7e9e3" />
 
 
-## Display of it compressing a 500MB mp4
-
-https://github.com/user-attachments/assets/57b73eef-14d7-4729-978c-c6eeac47860d
